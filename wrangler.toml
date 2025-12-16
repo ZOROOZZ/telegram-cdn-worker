@@ -1,0 +1,34 @@
+# Wrangler configuration for Cloudflare Workers
+name = "telegram-cdn-worker"
+main = "cloudflare-worker.js"
+compatibility_date = "2024-01-01"
+
+# KV Namespace for storing video metadata
+[[kv_namespaces]]
+binding = "VIDEOS"
+id = "YOUR_KV_NAMESPACE_ID"  # Replace with your actual KV namespace ID
+preview_id = "YOUR_PREVIEW_KV_NAMESPACE_ID"  # For development
+
+# Environment variables (sensitive data - set via dashboard or wrangler secret)
+# Don't commit actual values to Git!
+[vars]
+CHANNEL_ID = "@your_private_channel"  # Or -1001234567890
+
+# Secrets (set these via: wrangler secret put BOT_TOKEN)
+# BOT_TOKEN = "your_bot_token"
+# SECRET_KEY = "your_secret_key"
+
+# Route configuration
+[route]
+pattern = "your-domain.com/api/*"
+zone_name = "your-domain.com"
+
+# Custom domains
+# [env.production]
+# routes = [
+#   { pattern = "videos.yourdomain.com/api/*", zone_name = "yourdomain.com" }
+# ]
+
+# Development environment
+[env.development]
+name = "telegram-cdn-worker-dev"

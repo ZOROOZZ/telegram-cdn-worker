@@ -1,0 +1,29 @@
+{
+  "name": "telegram-cdn-cloudflare",
+  "version": "1.0.0",
+  "description": "Video library using Telegram CDN with Cloudflare Pages and Workers",
+  "main": "cloudflare-worker.js",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "deploy:worker": "wrangler deploy cloudflare-worker.js",
+    "tail": "wrangler tail",
+    "kv:create": "wrangler kv:namespace create VIDEOS",
+    "kv:list": "wrangler kv:key list --namespace-id=YOUR_KV_NAMESPACE_ID",
+    "pages:deploy": "wrangler pages deploy . --project-name=telegram-cdn-pages"
+  },
+  "keywords": [
+    "cloudflare",
+    "workers",
+    "pages",
+    "telegram",
+    "cdn",
+    "video",
+    "streaming"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  }
+}
