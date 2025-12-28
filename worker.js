@@ -1,18 +1,14 @@
-// worker.js - Cloudflare Worker for Telegram CDN Proxy
-// Deploy this to Cloudflare Workers
-
-// Environment variables needed (set in Cloudflare Dashboard):
-// BOT_TOKEN - Your Telegram bot token
-// CHANNEL_ID - Your Telegram channel ID
-// SECRET_KEY - Random secret for URL signing
-// VIDEOS - KV namespace binding
+// Cloudflare Worker with MTProto Support
+// Small files (<20 MB): Bot API
+// Large files (>20 MB): MTProto Service
 
 export default {
   async fetch(request, env) {
     const corsHeaders = {
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
+      'Access-Control-Allow-Headers': 'Content-Type, Range',
+      'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Accept-Ranges',
     };
 
     if (request.method === 'OPTIONS') {
@@ -25,6 +21,10 @@ export default {
     try {
       if (path === '/api/upload' && request.method === 'POST') {
         return await handleUpload(request, env, corsHeaders);
+      }
+      
+      if (path === '/api/save-metadata' && request.method === 'POST') {
+        return await handleSaveMetadata(request, env, corsHeaders);
       }
       
       if (path === '/api/videos' && request.method === 'GET') {
@@ -56,7 +56,6 @@ export default {
   }
 };
 
-// Upload video to Telegram
 async function handleUpload(request, env, corsHeaders) {
   try {
     const formData = await request.formData();
@@ -68,8 +67,7 @@ async function handleUpload(request, env, corsHeaders) {
       return jsonResponse({ success: false, error: 'No video file' }, corsHeaders, 400);
     }
 
-    // Check file size
-    const maxSize = 2 * 1024 * 1024 * 1024; // 2GB
+    const maxSize = 2 * 1024 * 1024 * 1024;
     if (videoFile.size > maxSize) {
       return jsonResponse({ 
         success: false, 
@@ -77,7 +75,6 @@ async function handleUpload(request, env, corsHeaders) {
       }, corsHeaders, 400);
     }
 
-    // Upload to Telegram
     const telegramFormData = new FormData();
     telegramFormData.append('chat_id', env.CHANNEL_ID);
     telegramFormData.append('video', videoFile);
@@ -101,11 +98,9 @@ async function handleUpload(request, env, corsHeaders) {
       }, corsHeaders, 500);
     }
 
-    // Extract video info
     const video = result.result.video;
     const videoId = generateVideoId();
     
-    // Store metadata in KV
     const metadata = {
       id: videoId,
       title,
@@ -125,7 +120,6 @@ async function handleUpload(request, env, corsHeaders) {
 
     await env.VIDEOS.put(`video:${videoId}`, JSON.stringify(metadata));
     
-    // Add to video list
     const videoList = await getVideoList(env);
     videoList.unshift(videoId);
     await env.VIDEOS.put('video:list', JSON.stringify(videoList));
@@ -135,6 +129,8 @@ async function handleUpload(request, env, corsHeaders) {
       videoId,
       title,
       duration: video.duration,
+      fileSize: video.file_size,
+      isLarge: video.file_size > 20 * 1024 * 1024,
     }, corsHeaders);
 
   } catch (error) {
@@ -143,7 +139,32 @@ async function handleUpload(request, env, corsHeaders) {
   }
 }
 
-// Get all videos
+async function handleSaveMetadata(request, env, corsHeaders) {
+  try {
+    const metadata = await request.json();
+    
+    if (!metadata || !metadata.id) {
+      return jsonResponse({ success: false, error: 'Invalid metadata' }, corsHeaders, 400);
+    }
+    
+    console.log('Saving metadata for video:', metadata.id);
+    
+    // Save metadata to KV
+    await env.VIDEOS.put(`video:${metadata.id}`, JSON.stringify(metadata));
+    
+    // Add to video list
+    const videoList = await getVideoList(env);
+    videoList.unshift(metadata.id);
+    await env.VIDEOS.put('video:list', JSON.stringify(videoList));
+    
+    return jsonResponse({ success: true, videoId: metadata.id }, corsHeaders);
+    
+  } catch (error) {
+    console.error('Save metadata error:', error);
+    return jsonResponse({ success: false, error: error.message }, corsHeaders, 500);
+  }
+}
+
 async function handleGetVideos(env, corsHeaders) {
   try {
     const videoList = await getVideoList(env);
@@ -160,6 +181,7 @@ async function handleGetVideos(env, corsHeaders) {
           duration: metadata.duration,
           views: metadata.views,
           uploadDate: metadata.uploadDate,
+          fileSize: metadata.fileSize,
         });
       }
     }
@@ -170,7 +192,6 @@ async function handleGetVideos(env, corsHeaders) {
   }
 }
 
-// Get single video details
 async function handleGetVideo(request, env, corsHeaders) {
   try {
     const url = new URL(request.url);
@@ -182,8 +203,6 @@ async function handleGetVideo(request, env, corsHeaders) {
     }
 
     const metadata = JSON.parse(metadataStr);
-    
-    // Generate signed URL
     const { signature, expires } = generateSignedUrl(videoId, env.SECRET_KEY);
 
     return jsonResponse({
@@ -195,7 +214,8 @@ async function handleGetVideo(request, env, corsHeaders) {
         duration: metadata.duration,
         views: metadata.views,
         uploadDate: metadata.uploadDate,
-        streamUrl: `/api/video/${videoId}/stream?signature=${signature}&expires=${expires}`
+        fileSize: metadata.fileSize,
+        streamUrl: `/api/video/${videoId}/stream?signature=${signature}&expires=${expires}`,
       }
     }, corsHeaders);
 
@@ -204,7 +224,7 @@ async function handleGetVideo(request, env, corsHeaders) {
   }
 }
 
-// Stream video (PROXY - hides Telegram)
+// HYBRID STREAMING with MTProto
 async function handleStream(request, env, corsHeaders) {
   try {
     const url = new URL(request.url);
@@ -212,7 +232,6 @@ async function handleStream(request, env, corsHeaders) {
     const signature = url.searchParams.get('signature');
     const expires = url.searchParams.get('expires');
 
-    // Verify signed URL
     if (!verifySignedUrl(videoId, signature, expires, env.SECRET_KEY)) {
       return jsonResponse({ error: 'Invalid or expired signature' }, corsHeaders, 403);
     }
@@ -223,34 +242,97 @@ async function handleStream(request, env, corsHeaders) {
     }
 
     const metadata = JSON.parse(metadataStr);
-
-    // Increment view count
     metadata.views++;
     await env.VIDEOS.put(`video:${videoId}`, JSON.stringify(metadata));
 
-    // Get file URL from Telegram
+    const isLarge = metadata.fileSize > 20 * 1024 * 1024;
+
+    // LARGE FILES: Use MTProto Service
+    if (isLarge) {
+      console.log(`Large file (${metadata.fileSize} bytes), using MTProto service`);
+      
+      // Get MTProto service URL from environment
+      const mtprotoServiceUrl = env.MTPROTO_SERVICE_URL || 'https://your-mtproto-service.onrender.com';
+      
+      // Option 1: Stream by message_id (recommended - more reliable)
+      const mtprotoUrl = `${mtprotoServiceUrl}/stream-from-message/${metadata.messageId}`;
+      
+      // Option 2: Stream by file_id (alternative)
+      // const mtprotoUrl = `${mtprotoServiceUrl}/stream/${metadata.fileId}`;
+      
+      console.log(`Proxying to MTProto service: ${mtprotoUrl}`);
+      
+      // Proxy the request to MTProto service
+      const mtprotoResponse = await fetch(mtprotoUrl, {
+        headers: {
+          'Range': request.headers.get('Range') || 'bytes=0-',
+        }
+      });
+      
+      if (!mtprotoResponse.ok) {
+        console.error(`MTProto service error: ${mtprotoResponse.status}`);
+        return jsonResponse({ 
+          error: 'Failed to stream from MTProto service',
+          status: mtprotoResponse.status 
+        }, corsHeaders, 500);
+      }
+      
+      // Create response with proper headers
+      const headers = new Headers();
+      headers.set('Access-Control-Allow-Origin', '*');
+      headers.set('Access-Control-Allow-Methods', 'GET, OPTIONS');
+      headers.set('Access-Control-Allow-Headers', 'Range');
+      headers.set('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Accept-Ranges');
+      headers.set('Content-Type', 'video/mp4');
+      headers.set('Accept-Ranges', 'bytes');
+      headers.set('Cache-Control', 'public, max-age=3600');
+      
+      // Copy important headers from MTProto response
+      if (mtprotoResponse.headers.get('Content-Range')) {
+        headers.set('Content-Range', mtprotoResponse.headers.get('Content-Range'));
+      }
+      
+      if (mtprotoResponse.headers.get('Content-Length')) {
+        headers.set('Content-Length', mtprotoResponse.headers.get('Content-Length'));
+      }
+      
+      return new Response(mtprotoResponse.body, {
+        status: mtprotoResponse.status,
+        headers: headers
+      });
+    }
+
+    // SMALL FILES: Use Bot API
+    console.log(`Small file (${metadata.fileSize} bytes), using Bot API`);
+    
     const fileResponse = await fetch(
       `https://api.telegram.org/bot${env.BOT_TOKEN}/getFile?file_id=${metadata.fileId}`
     );
     const fileResult = await fileResponse.json();
 
     if (!fileResult.ok) {
-      return jsonResponse({ error: 'Failed to get file' }, corsHeaders, 500);
+      return jsonResponse({ 
+        error: 'Failed to get file from Telegram', 
+        details: fileResult.description 
+      }, corsHeaders, 500);
     }
 
     const fileUrl = `https://api.telegram.org/file/bot${env.BOT_TOKEN}/${fileResult.result.file_path}`;
 
-    // Proxy the video stream
     const videoResponse = await fetch(fileUrl, {
       headers: {
         'Range': request.headers.get('Range') || 'bytes=0-'
       }
     });
 
-    // Create response with proper headers (hide Telegram origin)
-    const headers = new Headers(corsHeaders);
+    const headers = new Headers();
+    headers.set('Access-Control-Allow-Origin', '*');
+    headers.set('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    headers.set('Access-Control-Allow-Headers', 'Range');
+    headers.set('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Accept-Ranges');
     headers.set('Content-Type', 'video/mp4');
     headers.set('Accept-Ranges', 'bytes');
+    headers.set('Cache-Control', 'public, max-age=3600');
     
     if (videoResponse.headers.get('Content-Range')) {
       headers.set('Content-Range', videoResponse.headers.get('Content-Range'));
@@ -260,11 +342,10 @@ async function handleStream(request, env, corsHeaders) {
       headers.set('Content-Length', videoResponse.headers.get('Content-Length'));
     }
 
-    // Remove any Telegram-specific headers
-    headers.delete('X-Telegram-Bot-Api-Secret-Token');
+    const responseStatus = videoResponse.headers.get('Content-Range') ? 206 : 200;
     
     return new Response(videoResponse.body, {
-      status: videoResponse.status,
+      status: responseStatus,
       headers: headers
     });
 
@@ -274,7 +355,6 @@ async function handleStream(request, env, corsHeaders) {
   }
 }
 
-// Delete video
 async function handleDelete(request, env, corsHeaders) {
   try {
     const url = new URL(request.url);
@@ -287,7 +367,6 @@ async function handleDelete(request, env, corsHeaders) {
 
     const metadata = JSON.parse(metadataStr);
 
-    // Delete from Telegram
     await fetch(
       `https://api.telegram.org/bot${env.BOT_TOKEN}/deleteMessage`,
       {
@@ -300,10 +379,8 @@ async function handleDelete(request, env, corsHeaders) {
       }
     );
 
-    // Remove from KV
     await env.VIDEOS.delete(`video:${videoId}`);
 
-    // Update video list
     const videoList = await getVideoList(env);
     const newList = videoList.filter(id => id !== videoId);
     await env.VIDEOS.put('video:list', JSON.stringify(newList));
@@ -314,8 +391,6 @@ async function handleDelete(request, env, corsHeaders) {
     return jsonResponse({ success: false, error: error.message }, corsHeaders, 500);
   }
 }
-
-// Helper functions
 
 function generateVideoId() {
   return Array.from(crypto.getRandomValues(new Uint8Array(16)))
@@ -328,20 +403,25 @@ async function getVideoList(env) {
   return listStr ? JSON.parse(listStr) : [];
 }
 
-function generateSignedUrl(videoId, secretKey, expiresIn = 3600) {
-  const expires = Date.now() + (expiresIn * 1000);
+function generateSignedUrl(videoId, secretKey, expiresIn = 86400) {
+  const expires = Math.floor(Date.now() + (expiresIn * 1000));
   const data = `${videoId}:${expires}`;
   const signature = btoa(data + secretKey).slice(0, 32);
-  return { signature, expires };
+  return { signature, expires: expires.toString() };
 }
 
 function verifySignedUrl(videoId, signature, expires, secretKey) {
-  if (Date.now() > parseInt(expires)) {
+  try {
+    const expiresNum = parseInt(expires);
+    if (isNaN(expiresNum) || Date.now() > expiresNum) {
+      return false;
+    }
+    const data = `${videoId}:${expires}`;
+    const expectedSignature = btoa(data + secretKey).slice(0, 32);
+    return signature === expectedSignature;
+  } catch (error) {
     return false;
   }
-  const data = `${videoId}:${expires}`;
-  const expectedSignature = btoa(data + secretKey).slice(0, 32);
-  return signature === expectedSignature;
 }
 
 function jsonResponse(data, corsHeaders, status = 200) {
